@@ -11,6 +11,10 @@ Usage :
     python main.py --camera 1         # forcer l'index caméra
     python main.py --no-camera        # désactiver le serveur caméra
     python main.py --demo             # injecter une faute après 30s
+
+Endpoints de debug disponibles sur port 5000 :
+    POST /debug/disconnect?seconds=10   →  coupe OPC UA N secondes
+    GET  /debug/status                  →  état du serveur OPC UA
 """
 
 import asyncio
@@ -79,19 +83,21 @@ async def async_main(args):
         from camera_server import start_camera_server
         cam_thread = threading.Thread(
             target=start_camera_server,
-            args=(args.camera,),
+            kwargs={"device_index": args.camera, "opc_server": opc},
             daemon=True
         )
         cam_thread.start()
         log.info(f"Serveur caméra lancé — http://0.0.0.0:5000/stream (device {args.camera})")
 
-    log.info("=" * 55)
+    log.info("=" * 60)
     log.info("  MachineSight Simulator")
     log.info("  OPC UA  → opc.tcp://<votre_ip>:4840/machinesight/simulator/")
     if not args.no_camera:
         log.info("  Caméra  → http://<votre_ip>:5000/stream")
+        log.info("  Debug   → POST http://<votre_ip>:5000/debug/disconnect?seconds=10")
+        log.info("            GET  http://<votre_ip>:5000/debug/status")
     log.info("  Ctrl+C pour arrêter")
-    log.info("=" * 55)
+    log.info("=" * 60)
 
     try:
         await asyncio.gather(*tasks)
