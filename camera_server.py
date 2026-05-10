@@ -2,13 +2,17 @@
 camera_server.py
 Capture la webcam Logitech et diffuse le flux en MJPEG sur HTTP port 5000.
 Le client C# n'a qu'à lire http://<ip_raspberry>:5000/stream
+
+Endpoints de debug (Polly / tests de résilience) :
+  POST /debug/disconnect?seconds=5   →  coupe le serveur OPC UA N secondes
+  GET  /debug/status                 →  état courant du serveur OPC UA
 """
 
 import cv2
 import threading
 import time
 import logging
-from flask import Flask, Response, jsonify
+from flask import Flask, Response, jsonify, request
 
 log = logging.getLogger("camera_server")
 app = Flask(__name__)
@@ -19,6 +23,9 @@ _latest_frame: bytes | None = None
 _camera_ok   = False
 _fps_counter = 0
 _fps_actual  = 0.0
+
+# Référence vers OpcUaServer, injectée par start_camera_server()
+_opc_server = None
 
 
 def _capture_loop(device_index: int = 0):
@@ -48,7 +55,6 @@ def _capture_loop(device_index: int = 0):
             time.sleep(0.05)
             continue
 
-        # Overlays informatifs sur l'image
         _draw_overlay(frame)
 
         ok, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
@@ -57,14 +63,13 @@ def _capture_loop(device_index: int = 0):
                 _latest_frame = buffer.tobytes()
             frame_count += 1
 
-        # Calcul FPS réel
         now = time.time()
         if now - last_fps_t >= 1.0:
             _fps_actual  = frame_count / (now - last_fps_t)
             frame_count  = 0
             last_fps_t   = now
 
-        time.sleep(0.033)   # ~30 fps max
+        time.sleep(0.033)
 
     cap.release()
 
@@ -80,12 +85,10 @@ def _run_fallback_loop():
     t = 0
     while True:
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        # Fond dégradé animé
         for y in range(480):
             val = int(30 + 20 * abs(((y + t * 2) % 480) / 480 - 0.5))
             frame[y, :] = [val, val // 2, val // 3]
 
-        # Texte indicatif
         cv2.putText(frame, "SIMULATION MODE", (160, 200),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 220, 80), 2)
         cv2.putText(frame, "No camera detected", (185, 250),
@@ -93,7 +96,6 @@ def _run_fallback_loop():
         cv2.putText(frame, f"t = {t/10:.1f}s", (280, 310),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 180, 255), 1)
 
-        # Cercle animé simulant une pièce détectée
         cx = 320 + int(100 * __import__('math').sin(t * 0.15))
         cy = 380
         cv2.circle(frame, (cx, cy), 20, (0, 200, 255), 2)
@@ -118,7 +120,7 @@ def _draw_overlay(frame):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
 
 
-# ── Routes Flask ────────────────────────────────────────────────────────────
+# ── Routes Flask — caméra ───────────────────────────────────────────────────
 
 def _generate_mjpeg():
     """Générateur de frames MJPEG pour le streaming HTTP."""
@@ -129,6 +131,7 @@ def _generate_mjpeg():
             yield (
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n"
+                + f"Content-Length: {len(frame)}\r\n\r\n".encode()
                 + frame +
                 b"\r\n"
             )
@@ -164,11 +167,80 @@ def status():
     })
 
 
-def start_camera_server(device_index: int = 0):
-    """Lance le thread de capture et le serveur Flask."""
+# ── Routes Flask — debug OPC UA ─────────────────────────────────────────────
+
+@app.route("/debug/disconnect", methods=["POST"])
+def debug_disconnect():
+    """
+    Coupe le serveur OPC UA pendant N secondes pour tester la résilience
+    du client C# (Polly retry / circuit breaker).
+
+    Usage :
+        POST http://<ip>:5000/debug/disconnect?seconds=10
+        POST http://<ip>:5000/debug/disconnect          # défaut : 5s
+
+    Réponses :
+        200  { "ok": true,  "duration_s": 10, "message": "..." }
+        409  { "ok": false, "message": "Déconnexion déjà en cours" }
+        503  { "ok": false, "message": "OPC UA server non disponible" }
+    """
+    if _opc_server is None:
+        return jsonify({"ok": False, "message": "OPC UA server non disponible"}), 503
+
+    try:
+        seconds = float(request.args.get("seconds", 5))
+        seconds = max(1.0, min(seconds, 120.0))   # garde-fou : 1–120 s
+    except (TypeError, ValueError):
+        seconds = 5.0
+
+    accepted = _opc_server.schedule_disconnect(seconds)
+    if not accepted:
+        return jsonify({
+            "ok": False,
+            "message": "Déconnexion déjà en cours, réessayez plus tard."
+        }), 409
+
+    log.warning(f"[DEBUG] Déconnexion OPC UA demandée via HTTP — {seconds:.0f}s")
+    return jsonify({
+        "ok": True,
+        "duration_s": seconds,
+        "message": f"Serveur OPC UA sera hors ligne pendant {seconds:.0f}s."
+    })
+
+
+@app.route("/debug/status")
+def debug_status():
+    """
+    Retourne l'état courant du serveur OPC UA.
+
+    Usage :
+        GET http://<ip>:5000/debug/status
+    """
+    if _opc_server is None:
+        return jsonify({"opc_connected": False, "message": "OPC UA server non disponible"}), 503
+
+    connected = not _opc_server.is_disconnected
+    return jsonify({
+        "opc_connected": connected,
+        "message": "En ligne" if connected else "Déconnexion temporaire en cours"
+    })
+
+
+# ── Démarrage ────────────────────────────────────────────────────────────────
+
+def start_camera_server(device_index: int = 0, opc_server=None):
+    """
+    Lance le thread de capture et le serveur Flask.
+
+    Args:
+        device_index: index de la caméra (0 par défaut).
+        opc_server:   instance OpcUaServer, nécessaire pour les endpoints /debug/*.
+    """
+    global _opc_server
+    _opc_server = opc_server
+
     t = threading.Thread(target=_capture_loop, args=(device_index,), daemon=True)
     t.start()
-    # Attendre la première frame
     for _ in range(30):
         with _frame_lock:
             if _latest_frame:
